@@ -1,5 +1,5 @@
 """
-Training & Conditioning Tracker v3 (データリセット版)
+Training & Conditioning Tracker v3 (本番運用版・ダミーデータなし)
 """
 
 import streamlit as st
@@ -19,10 +19,6 @@ st.set_page_config(
 
 DATA_SESSIONS_FILE = "workout_sessions_v3.csv"
 DATA_DAILY_FILE = "daily_condition_v3.csv"
-
-# --- データを初期化（ダミーデータを空ファイルで上書き） ---
-pd.DataFrame(columns=["date", "category", "duration", "rpe", "load", "calc_method", "note"]).to_csv(DATA_SESSIONS_FILE, index=False)
-pd.DataFrame(columns=["date", "sleep_start", "sleep_end", "weight", "rhr", "hrv"]).to_csv(DATA_DAILY_FILE, index=False)
 
 DEFAULT_AGE = 25
 DEFAULT_HR_MAX = 220 - DEFAULT_AGE  # 195 bpm
@@ -61,6 +57,14 @@ WEATHER_COEFFS = {
     "雨・暑い": 1.35
 }
 
+# --- 空のデータストレージを初期化（ダミー生成なし） ---
+if not os.path.exists(DATA_SESSIONS_FILE):
+    pd.DataFrame(columns=["date", "category", "duration", "rpe", "load", "calc_method", "note"]).to_csv(DATA_SESSIONS_FILE, index=False)
+
+if not os.path.exists(DATA_DAILY_FILE):
+    pd.DataFrame(columns=["date", "sleep_start", "sleep_end", "weight", "rhr", "hrv"]).to_csv(DATA_DAILY_FILE, index=False)
+
+# --- 計算関数群 ---
 def calc_sleep_hours(start_str, end_str):
     try:
         t_start = datetime.datetime.strptime(start_str, "%H:%M")
@@ -84,22 +88,7 @@ def calc_banister_trimp(duration_min, hr_avg, hr_rest, hr_max=195, gender="male"
 
 def compute_banister_model(daily_df, sessions_df, tau1=45, tau2=15, k1=1.0, k2=2.0):
     if daily_df.empty:
-        # 空のデータフレーム用ダミー行
-        return pd.DataFrame([{
-            "date": pd.to_datetime(datetime.date.today()),
-            "sleep_hours": 0.0,
-            "sleep_7d_total": 0.0,
-            "hrv": 0,
-            "hrv_7d_avg": 0.0,
-            "rhr": 0,
-            "rhr_mean": 0.0,
-            "weight": 0.0,
-            "day_trimp": 0.0,
-            "prev_day_trimp": 0.0,
-            "fitness": 0.0,
-            "fatigue": 0.0,
-            "performance": 0.0
-        }])
+        return pd.DataFrame()
 
     daily = daily_df.copy()
     daily["date"] = pd.to_datetime(daily["date"])
@@ -107,3 +96,317 @@ def compute_banister_model(daily_df, sessions_df, tau1=45, tau2=15, k1=1.0, k2=2
 
     if not sessions_df.empty:
         sess = sessions_df.copy()
+        sess["date"] = pd.to_datetime(sess["date"])
+        trimp_sum = sess.groupby("date")["load"].sum().reset_index()
+        trimp_sum.columns = ["date", "day_trimp"]
+        daily = pd.merge(daily, trimp_sum, on="date", how="left").fillna({"day_trimp": 0})
+    else:
+        daily["day_trimp"] = 0
+
+    daily["sleep_hours"] = daily.apply(lambda r: calc_sleep_hours(str(r["sleep_start"]), str(r["sleep_end"])), axis=1)
+    daily["sleep_7d_total"] = daily["sleep_hours"].rolling(window=7, min_periods=1).sum().round(1)
+    daily["hrv_7d_avg"] = daily["hrv"].rolling(window=7, min_periods=1).mean().round(1)
+    daily["rhr_mean"] = daily["rhr"].expanding(min_periods=1).mean().round(1)
+    daily["prev_day_trimp"] = daily["day_trimp"].shift(1).fillna(0)
+
+    n = len(daily)
+    fitness = np.zeros(n)
+    fatigue = np.zeros(n)
+
+    decay_fit = np.exp(-1.0 / tau1)
+    decay_fat = np.exp(-1.0 / tau2)
+
+    for t in range(n):
+        w_t = daily.loc[t, "day_trimp"]
+        if t == 0:
+            fitness[t] = w_t
+            fatigue[t] = w_t
+        else:
+            fitness[t] = w_t + fitness[t - 1] * decay_fit
+            fatigue[t] = w_t + fatigue[t - 1] * decay_fat
+
+    daily["fitness"] = np.round(fitness, 1)
+    daily["fatigue"] = np.round(fatigue, 1)
+    daily["performance"] = np.round(k1 * daily["fitness"] - k2 * daily["fatigue"], 1)
+
+    return daily
+
+# --- データ読み込み ---
+sessions_df = pd.read_csv(DATA_SESSIONS_FILE)
+daily_df = pd.read_csv(DATA_DAILY_FILE)
+avg_rhr_recorded = round(daily_df["rhr"].mean(), 1) if not daily_df.empty else 52.0
+
+st.title("🥋 統合トレーニング & コンディション分析システム v3")
+st.markdown("フィットネス-疲労理論 (Banister) とセッションRPE、心拍TRIMP、前日リカバリー（睡眠・RHR・HRV）一元管理ダッシュボード")
+
+# サイドバー: 入力フォーム
+st.sidebar.header("📝 データ入力")
+entry_type = st.sidebar.radio("入力項目を選択", ["練習セッション記録 (ランTRIMP対応)", "朝のコンディション記録 (前日睡眠・RHR・HRV)"])
+
+if entry_type == "練習セッション記録 (ランTRIMP対応)":
+    st.sidebar.subheader("練習セッションの追加")
+    with st.sidebar.form("session_form"):
+        s_date = st.date_input("練習日 (日付)", datetime.date.today())
+        s_cat = st.selectbox("カテゴリ / 計算方式", list(CATEGORY_DEFAULTS.keys()))
+        s_note = st.text_input("メニュー詳細・メモ", placeholder="例: 乱取8本、ジョグ6km、スクワット等")
+
+        s_load = 0.0
+        calc_method = "Session-RPE"
+        s_rpe_val = 5
+
+        if s_cat == "ランニング（心拍計測: Banister法）":
+            calc_method = "Banister-HR"
+            st.markdown("---")
+            st.caption("❤️ Banister予備心拍数TRIMP計算")
+            c_r1, c_r2 = st.columns(2)
+            with c_r1:
+                r_dur = st.number_input("ランニング時間 (分)", min_value=1, max_value=300, value=40, step=5)
+                r_hr_avg = st.number_input("平均心拍数 (bpm)", min_value=60, max_value=220, value=150)
+            with c_r2:
+                r_hr_max = st.number_input("最大心拍数 (25歳設定: 195bpm)", value=DEFAULT_HR_MAX)
+                r_hr_rest = st.number_input("安静時心拍数 (記録平均)", value=float(avg_rhr_recorded))
+            
+            s_dur = r_dur
+            s_load = calc_banister_trimp(r_dur, r_hr_avg, r_hr_rest, r_hr_max, gender="male")
+            delta_hr_ratio = round((r_hr_avg - r_hr_rest) / (r_hr_max - r_hr_rest), 3) if r_hr_max > r_hr_rest else 0
+            st.info(f"📊 予備心拍比: {delta_hr_ratio} ｜ 算出TRIMP: {s_load} AU")
+
+        elif s_cat == "ランニング（ペース・環境係数法）":
+            calc_method = "Pace-Coeff"
+            st.markdown("---")
+            p_dist = st.number_input("走行距離 (km)", min_value=0.5, max_value=50.0, value=5.0, step=0.5)
+            p_pace = st.selectbox("ペース帯 (強度係数)", list(PACE_COEFFS.keys()))
+            c_p1, c_p2 = st.columns(2)
+            with c_p1:
+                p_surf = st.selectbox("路面", list(SURFACE_COEFFS.keys()), index=0)
+            with c_p2:
+                p_weat = st.selectbox("天候・気温", list(WEATHER_COEFFS.keys()), index=0)
+            
+            s_dur = st.number_input("所要時間 (分)", min_value=5, max_value=300, value=25, step=5)
+            k_pace = PACE_COEFFS[p_pace]
+            k_surf = SURFACE_COEFFS[p_surf]
+            k_weat = WEATHER_COEFFS[p_weat]
+            s_load = round(k_pace * p_dist * k_surf * k_weat * 10, 1)
+            st.info(f"算出TRIMP: {s_load} AU")
+
+        else:
+            calc_method = "Session-RPE"
+            s_dur = st.number_input("実施時間 (分)", min_value=5, max_value=300, value=60, step=5)
+            def_rpe = CATEGORY_DEFAULTS[s_cat]["rpe"] if CATEGORY_DEFAULTS[s_cat]["rpe"] else 5
+            st.caption(f"💡 目安: {CATEGORY_DEFAULTS[s_cat]['desc']}")
+            s_rpe_val = st.slider("自覚的運動強度 RPE (CR-10)", min_value=1, max_value=10, value=def_rpe)
+            s_load = round(s_dur * s_rpe_val, 1)
+            st.info(f"算出負荷 (TRIMP): {s_load} AU")
+
+        submitted = st.form_submit_button("セッションを登録")
+        if submitted:
+            new_sess = pd.DataFrame([{
+                "date": s_date.strftime("%Y-%m-%d"),
+                "category": s_cat,
+                "duration": s_dur,
+                "rpe": s_rpe_val,
+                "load": s_load,
+                "calc_method": calc_method,
+                "note": s_note
+            }])
+            curr_sess = pd.read_csv(DATA_SESSIONS_FILE)
+            updated = pd.concat([curr_sess, new_sess], ignore_index=True)
+            updated.to_csv(DATA_SESSIONS_FILE, index=False)
+            st.sidebar.success("セッションを登録しました！")
+            st.rerun()
+
+else:
+    st.sidebar.subheader("朝のコンディション登録")
+    st.sidebar.caption("※朝のRHR・HRVおよび睡眠時間は、前日練習に対する回復結果を記録します。")
+    with st.sidebar.form("daily_form"):
+        d_date = st.date_input("測定日（今朝の日付）", datetime.date.today())
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            d_sleep_start = st.text_input("前夜の入眠 (HH:MM)", "21:30")
+        with col_s2:
+            d_sleep_end = st.text_input("今朝の起床 (HH:MM)", "05:30")
+        
+        d_calc_hours = calc_sleep_hours(d_sleep_start, d_sleep_end)
+        st.caption(f"睡眠時間計算: 約 {d_calc_hours} 時間")
+
+        d_weight = st.number_input("今朝の体重 (kg)", min_value=40.0, max_value=150.0, value=75.0, step=0.1)
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            d_rhr = st.number_input("安静時心拍数 RHR (bpm)", min_value=35, max_value=120, value=52)
+        with col_c2:
+            d_hrv = st.number_input("心拍変動 HRV (rMSSD)", min_value=10, max_value=200, value=65)
+
+        d_submitted = st.form_submit_button("コンディションを登録")
+        if d_submitted:
+            curr_daily = pd.read_csv(DATA_DAILY_FILE)
+            d_str = d_date.strftime("%Y-%m-%d")
+            if d_str in curr_daily["date"].values:
+                curr_daily.loc[curr_daily["date"] == d_str, ["sleep_start", "sleep_end", "weight", "rhr", "hrv"]] = [
+                    d_sleep_start, d_sleep_end, d_weight, d_rhr, d_hrv
+                ]
+            else:
+                new_row = pd.DataFrame([{
+                    "date": d_str,
+                    "sleep_start": d_sleep_start,
+                    "sleep_end": d_sleep_end,
+                    "weight": d_weight,
+                    "rhr": d_rhr,
+                    "hrv": d_hrv
+                }])
+                curr_daily = pd.concat([curr_daily, new_row], ignore_index=True)
+            curr_daily.to_csv(DATA_DAILY_FILE, index=False)
+            st.sidebar.success(f"{d_str} のデータを保存しました！")
+            st.rerun()
+
+# データの個別削除機能
+with st.sidebar.expander("🗑️ 誤入力・記録の削除"):
+    del_target = st.radio("削除する種別", ["練習セッション", "朝のコンディション"])
+    if del_target == "練習セッション":
+        curr_sess = pd.read_csv(DATA_SESSIONS_FILE)
+        if not curr_sess.empty:
+            sess_options = [f"{i}: {r['date']} - {r['category']} ({r['load']}AU)" for i, r in curr_sess.iterrows()]
+            selected_sess = st.selectbox("削除するセッションを選択", sess_options)
+            if st.button("選択したセッションを削除", type="primary"):
+                idx = int(selected_sess.split(":")[0])
+                curr_sess = curr_sess.drop(index=idx).reset_index(drop=True)
+                curr_sess.to_csv(DATA_SESSIONS_FILE, index=False)
+                st.success("削除しました")
+                st.rerun()
+        else:
+            st.caption("記録がありません")
+    else:
+        curr_daily = pd.read_csv(DATA_DAILY_FILE)
+        if not curr_daily.empty:
+            daily_options = [f"{i}: {r['date']} (RHR:{r['rhr']} HRV:{r['hrv']})" for i, r in curr_daily.iterrows()]
+            selected_daily = st.selectbox("削除する記録日を選択", daily_options)
+            if st.button("選択した記録を削除", type="primary"):
+                idx = int(selected_daily.split(":")[0])
+                curr_daily = curr_daily.drop(index=idx).reset_index(drop=True)
+                curr_daily.to_csv(DATA_DAILY_FILE, index=False)
+                st.success("削除しました")
+                st.rerun()
+        else:
+            st.caption("記録がありません")
+
+# 一括データ初期化（全リセット）ボタン
+with st.sidebar.expander("⚠️ 全データ完全リセット"):
+    st.caption("既存のすべてのセッションとコンディション履歴を空にします。")
+    if st.button("全データを初期化する", type="primary"):
+        pd.DataFrame(columns=["date", "category", "duration", "rpe", "load", "calc_method", "note"]).to_csv(DATA_SESSIONS_FILE, index=False)
+        pd.DataFrame(columns=["date", "sleep_start", "sleep_end", "weight", "rhr", "hrv"]).to_csv(DATA_DAILY_FILE, index=False)
+        st.success("全データをリセットしました")
+        st.rerun()
+
+# パラメータスライダー
+with st.sidebar.expander("⚙️ Banisterモデル時定数・係数調整"):
+    tau1 = st.slider("フィットネス時定数 (τ1)", 20, 60, 45)
+    tau2 = st.slider("疲労時定数 (τ2)", 5, 25, 15)
+    k1 = st.slider("フィットネス重み (k1)", 0.5, 2.0, 1.0, 0.1)
+    k2 = st.slider("疲労重み (k2)", 1.0, 3.0, 2.0, 0.1)
+
+# --- 分析・ダッシュボード表示 ---
+sessions_df = pd.read_csv(DATA_SESSIONS_FILE)
+daily_df = pd.read_csv(DATA_DAILY_FILE)
+analyzed_df = compute_banister_model(daily_df, sessions_df, tau1=tau1, tau2=tau2, k1=k1, k2=k2)
+
+if analyzed_df.empty:
+    st.info("👋 まだデータが記録されていません。左のサイドバーから「朝のコンディション」または「練習セッション」を登録してください。")
+else:
+    latest = analyzed_df.iloc[-1]
+    st.subheader(f"📊 最新ステータス ({latest['date'].strftime('%Y-%m-%d')} 朝時点)")
+
+    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+    with kpi1:
+        perf = latest["performance"]
+        status_icon = "🟢 絶好調" if perf > 0 else ("🟡 調整期/疲労蓄積" if perf > -50 else "🔴 疲労過多")
+        kpi1.metric("Performance (調子)", f"{perf:.1f} AU", status_icon)
+
+    with kpi2:
+        kpi2.metric("前夜睡眠 / 直近7日計", f"{latest['sleep_hours']}h", f"7日計: {latest['sleep_7d_total']}h")
+
+    with kpi3:
+        hrv_delta = round(latest["hrv"] - latest["hrv_7d_avg"], 1)
+        kpi3.metric("今朝のHRV", f"{latest['hrv']} ms", f"7日比 {hrv_delta:+} ms")
+
+    with kpi4:
+        rhr_diff_mean = round(latest["rhr"] - avg_rhr_recorded, 1)
+        kpi4.metric("今朝のRHR", f"{latest['rhr']} bpm", f"平均比 {rhr_diff_mean:+} bpm")
+
+    with kpi5:
+        kpi5.metric("今朝の体重", f"{latest['weight']} kg")
+
+    st.markdown("---")
+
+    # 1. 曲線グラフ
+    st.subheader("📈 フィットネス - 疲労 - パフォーマンス曲線")
+    fig1 = make_subplots(specs=[[{"secondary_y": True}]])
+    colors = ["#3182CE", "#E53E3E", "#38A169", "#D69E2E", "#805AD5", "#4A5568"]
+
+    if not sessions_df.empty:
+        pivot_sess = sessions_df.copy()
+        pivot_sess["date"] = pd.to_datetime(pivot_sess["date"])
+        pivot_df = pivot_sess.pivot_table(index="date", columns="category", values="load", aggfunc="sum").fillna(0)
+        pivot_df = pivot_df.reindex(analyzed_df["date"]).fillna(0)
+
+        for i, cat in enumerate(pivot_df.columns):
+            fig1.add_trace(
+                go.Bar(
+                    x=pivot_df.index,
+                    y=pivot_df[cat],
+                    name=f"負荷: {cat}",
+                    marker_color=colors[i % len(colors)],
+                    opacity=0.65
+                ),
+                secondary_y=False
+            )
+    else:
+        fig1.add_trace(
+            go.Bar(x=analyzed_df["date"], y=analyzed_df["day_trimp"], name="Day TRIMP", marker_color="rgba(160, 174, 192, 0.4)"),
+            secondary_y=False
+        )
+
+    fig1.add_trace(go.Scatter(x=analyzed_df["date"], y=analyzed_df["fitness"], name=f"Fitness (体力: τ1={tau1})", line=dict(color="#2B6CB0", width=2.5)), secondary_y=False)
+    fig1.add_trace(go.Scatter(x=analyzed_df["date"], y=analyzed_df["fatigue"], name=f"Fatigue (疲労: τ2={tau2})", line=dict(color="#C53030", width=2.5, dash="dash")), secondary_y=False)
+    fig1.add_trace(go.Scatter(x=analyzed_df["date"], y=analyzed_df["performance"], name=f"Performance (予測調子: k2={k2})", line=dict(color="#D69E2E", width=3.5)), secondary_y=True)
+
+    fig1.update_layout(
+        height=480,
+        barmode="stack",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template="plotly_white",
+        margin=dict(l=20, r=20, t=30, b=20)
+    )
+    fig1.update_yaxes(title_text="TRIMP / Fitness / Fatigue (AU)", secondary_y=False)
+    fig1.update_yaxes(title_text="Performance (AU)", secondary_y=True, zeroline=True, zerolinecolor="gray")
+    st.plotly_chart(fig1, use_container_width=True)
+
+    # 2. リカバリーグラフ
+    st.subheader("🛌 前日練習負荷と翌朝リカバリー（睡眠・HRV・RHR）の因果照合")
+    col_g1, col_g2 = st.columns(2)
+
+    with col_g1:
+        fig_rec = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_rec.add_trace(go.Scatter(x=analyzed_df["date"], y=analyzed_df["hrv"], mode="lines+markers", name="今朝のHRV (ms)", line=dict(color="#38A169")), secondary_y=False)
+        fig_rec.add_trace(go.Scatter(x=analyzed_df["date"], y=analyzed_df["hrv_7d_avg"], mode="lines", name="HRV 7日平均", line=dict(color="#276749", dash="dot")), secondary_y=False)
+        fig_rec.add_trace(go.Scatter(x=analyzed_df["date"], y=analyzed_df["rhr"], mode="lines+markers", name="今朝のRHR (bpm)", line=dict(color="#DD6B20")), secondary_y=True)
+        fig_rec.add_trace(go.Scatter(x=analyzed_df["date"], y=[avg_rhr_recorded]*len(analyzed_df), mode="lines", name=f"全期間平均RHR ({avg_rhr_recorded})", line=dict(color="#A0AEC0", dash="dash")), secondary_y=True)
+        fig_rec.update_layout(height=360, title="自律神経応答 (今朝のHRV・RHR)", template="plotly_white", margin=dict(l=20, r=20, t=40, b=20), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        fig_rec.update_yaxes(title_text="HRV (ms)", secondary_y=False)
+        fig_rec.update_yaxes(title_text="RHR (bpm)", secondary_y=True)
+        st.plotly_chart(fig_rec, use_container_width=True)
+
+    with col_g2:
+        fig_slp = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_slp.add_trace(go.Bar(x=analyzed_df["date"], y=analyzed_df["sleep_hours"], name="前夜睡眠時間 (h)", marker_color="#805AD5", opacity=0.7), secondary_y=False)
+        fig_slp.add_trace(go.Scatter(x=analyzed_df["date"], y=analyzed_df["prev_day_trimp"], mode="lines+markers", name="前日の練習TRIMP (AU)", line=dict(color="#E53E3E", dash="dot")), secondary_y=True)
+        fig_slp.update_layout(height=360, title="前日練習負荷 vs 前夜睡眠時間", template="plotly_white", margin=dict(l=20, r=20, t=40, b=20), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        fig_slp.update_yaxes(title_text="睡眠時間 (h)", range=[0, 12], secondary_y=False)
+        fig_slp.update_yaxes(title_text="前日TRIMP (AU)", secondary_y=True)
+        st.plotly_chart(fig_slp, use_container_width=True)
+
+st.subheader("📋 直近の練習セッション記録")
+if sessions_df.empty:
+    st.caption("記録されているセッションはありません。")
+else:
+    st.dataframe(sessions_df.sort_values("date", ascending=False).head(15), use_container_width=True, hide_index=True)
