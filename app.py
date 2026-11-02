@@ -57,7 +57,8 @@ WEATHER_COEFFS = {
     "雨・暑い": 1.35
 }
 
-def init_sample_data():
+def init_sample_data():# init_sample_data()
+
     if not os.path.exists(DATA_DAILY_FILE):
         dates = pd.date_range(end=datetime.date.today(), periods=21)
         daily = []
